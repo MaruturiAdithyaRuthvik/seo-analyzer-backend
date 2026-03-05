@@ -1,13 +1,15 @@
+import os
+import re
+import json
+from urllib.parse import urlparse
+import requests
+from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-import requests
-from bs4 import BeautifulSoup
-import re
-import os
-import json
 from google import genai
 from dotenv import load_dotenv
+import uvicorn
 
 # 1. Load secret environment variables
 load_dotenv()
@@ -25,7 +27,7 @@ if GEMINI_API_KEY:
 else:
     print("WARNING: GEMINI_API_KEY not found. AI suggestions will not work.")
 
-# Add CORS middleware to allow your frontend to talk to this backend
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -39,19 +41,19 @@ class AnalyzePayload(BaseModel):
     target_keyword: str
 
 def generate_seo_suggestions(content_type: str, current_content: str, target_keyword: str = ""):
+    fallback_title = [
+        "Ensure your title is under 60 characters to prevent truncation.",
+        f"Include your target keyword '{target_keyword}' naturally.",
+        "Add more internal links to improve site architecture."
+    ]
+    fallback_meta = [
+        "Keep your meta description under 160 characters.",
+        "Add a compelling call-to-action to increase CTR.",
+        "Ensure relevant image alt text is present throughout the page."
+    ]
+    
     if not client:
-        if content_type == "Title":
-            return [
-                "Ensure your title is under 60 characters to prevent truncation.",
-                f"Include your target keyword '{target_keyword}' naturally.",
-                "Add more internal links to improve site architecture."
-            ]
-        else:
-            return [
-                "Keep your meta description under 160 characters.",
-                "Add a compelling call-to-action to increase CTR.",
-                "Ensure relevant image alt text is present throughout the page."
-            ]
+        return fallback_title if content_type == "Title" else fallback_meta
 
     kw_context = f" targeting the keyword '{target_keyword}'" if target_keyword else ""
     if content_type == "Title":
@@ -75,28 +77,16 @@ def generate_seo_suggestions(content_type: str, current_content: str, target_key
         return json.loads(text)
     except Exception as e:
         print(f"Gemini API Error: {e}")
-        if content_type == "Title":
-            return [
-                "Ensure your title is under 60 characters to prevent truncation.",
-                f"Include your target keyword '{target_keyword}' naturally.",
-                "Add more internal links to improve site architecture."
-            ]
-        else:
-            return [
-                "Keep your meta description under 160 characters.",
-                "Add a compelling call-to-action to increase CTR.",
-                "Ensure relevant image alt text is present throughout the page."
-            ]
+        return fallback_title if content_type == "Title" else fallback_meta
 
 @app.post("/analyze")
 def analyze_seo(payload: AnalyzePayload):
     url = payload.url
     target_keyword = payload.target_keyword.lower()
 
-    # 3. The Graceful Fallback for Strict Networks
     try:
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
         response = requests.get(url, headers=headers, timeout=5, verify=False)
         response.raise_for_status()
@@ -112,6 +102,8 @@ def analyze_seo(payload: AnalyzePayload):
             <body>
                 <h1>Fallback Test Website</h1>
                 <p>This is a fallback website used to test the Gemini AI integration because the local network blocked the web scraper. {target_keyword} {target_keyword}</p>
+                <a href="/internal">Internal</a> <a href="http://external.com">External</a>
+                <img src="test.jpg" alt="">
             </body>
         </html>
         """
@@ -120,7 +112,7 @@ def analyze_seo(payload: AnalyzePayload):
     results = {}
     all_ai_tips = []
 
-    # 4. Title logic
+    # 1. Title logic
     title_tag = soup.title
     title_passed = False
     title_text = ""
@@ -140,7 +132,7 @@ def analyze_seo(payload: AnalyzePayload):
     else:
         results["title"] = {"present": False, "length": 0, "pass": False, "text": ""}
 
-    # 5. Meta description logic
+    # 2. Meta description logic
     meta_desc_tag = soup.find("meta", attrs={"name": "description"})
     meta_passed = False
     desc_text = ""
@@ -160,7 +152,7 @@ def analyze_seo(payload: AnalyzePayload):
     else:
         results["meta_description"] = {"present": False, "length": 0, "pass": False, "text": ""}
 
-    # 6. Heading logic
+    # 3. Heading logic
     h1_tags = soup.find_all("h1")
     h1_count = len(h1_tags)
     results["h1"] = {
@@ -176,7 +168,7 @@ def analyze_seo(payload: AnalyzePayload):
     words = re.findall(r'\b\w+\b', text.lower())
     word_count = len(words)
 
-    # 7. Keyword logic
+    # 4. Keyword logic
     keyword_words = re.findall(r'\b\w+\b', target_keyword)
     keyword_count = 0
     if len(keyword_words) == 1:
@@ -193,13 +185,13 @@ def analyze_seo(payload: AnalyzePayload):
         "pass": 1.0 <= density <= 3.0 if word_count > 0 else False
     }
 
+    # 5. Word Count
     results["word_count"] = {
         "count": word_count,
         "pass": word_count >= 300
     }
 
-    # 8. Link Analysis
-    from urllib.parse import urlparse
+    # 6. Link Analysis
     parsed_url = urlparse(url)
     domain = parsed_url.netloc
 
@@ -214,16 +206,16 @@ def analyze_seo(payload: AnalyzePayload):
         elif href.startswith("http"):
             external_links += 1
         else:
-            internal_links += 1 # treat relative paths as internal
+            internal_links += 1 
 
     results["links"] = {
         "internal": internal_links,
         "external": external_links,
         "total": internal_links + external_links,
-        "pass": internal_links > 0 # Simple check to ensure page is connected
+        "pass": internal_links > 0
     }
 
-    # 9. Image Analysis
+    # 7. Image Analysis
     img_tags = soup.find_all("img")
     total_images = len(img_tags)
     missing_alt = 0
@@ -238,19 +230,11 @@ def analyze_seo(payload: AnalyzePayload):
         "pass": missing_alt == 0
     }
 
-    # 10. Attach AI recommendations right before returning
+    # Attach AI recommendations
     results["ai_recommendations"] = all_ai_tips
 
     return results
-import os
-import uvicorn
-
-# ... your existing FastAPI code (app = FastAPI(), etc.) ...
 
 if __name__ == "__main__":
-    # If 'PORT' exists in the environment (Cloud), use it. 
-    # Otherwise (Local), use 8000.
     port = int(os.environ.get("PORT", 8000))
-    
-    # Run the app
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
